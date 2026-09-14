@@ -2,7 +2,7 @@ name: build-and-publish
 
 # Re-based on the newest upstream image on every push, daily (cron) and on demand.
 # Content-addressed layers mean an unchanged upstream produces an unchanged image,
-# so the daily run is a cheap no-op unless upstream actually published something new.
+# so a daily run is a cheap no-op unless upstream actually published something new.
 
 on:
   push:
@@ -10,6 +10,12 @@ on:
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
+
+# Serialise runs: overlapping jobs fight over the runner tool caches
+# ("Unable to reserve cache with key docker.io--tonistiigi--binfmt-...").
+concurrency:
+  group: build-and-publish
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -23,13 +29,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # All actions are pinned to majors that run on Node 24 (Node 20 is deprecated).
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -44,7 +51,7 @@ jobs:
           echo "upstream base digest: ${digest}"
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           pull: true
@@ -62,17 +69,24 @@ jobs:
       - name: Smoke test - entrypoint chain
         run: docker run --rm "$IMAGE:latest" --version
 
-      # Gate 2: the shim must be the yt-dlp the bot finds (PATH order survived upstream).
-      - name: Smoke test - shim is first in PATH
+      # Gate 2: deterministic contract - shim wins the PATH lookup and injects the selector.
+      # This is what breaks visibly if upstream ever stops using exec.LookPath / last-format-wins.
+      - name: Smoke test - shim contract (offline)
         run: |
-          set -euo pipefail
-          out="$(docker run --rm -e BOT_BINARY=/bin/sh "$IMAGE:latest" -c 'command -v yt-dlp')"
-          echo "$out"
-          echo "$out" | grep -qx '/tmp/yt-dlp-shim/yt-dlp'
+          docker run --rm -e BOT_BINARY=/bin/sh -v "$PWD/ci:/ci:ro" \
+            "$IMAGE:latest" /ci/check-h264.sh --offline
 
-      # Gate 3: the forced selector must really produce H.264/mp4. Needs YouTube from the
-      # runner; when it is unreachable the check is reported but does not block the build.
-      - name: Smoke test - H.264 selection
+      # Gate 3: real resolution must yield mp4/H.264/AAC. Needs YouTube reachable from the
+      # runner; reported as a warning (not a failure) when it is not, so that a blocked
+      # datacenter IP cannot fail an otherwise good build - but it can never pass silently.
+      - name: Smoke test - H.264 resolution (network)
+        id: h264
         continue-on-error: true
         run: |
-          docker run --rm -e BOT_BINARY=/bin/sh -v "$PWD/ci:/ci:ro" "$IMAGE:latest" /bin/sh /ci/check-h264.sh
+          docker run --rm -e BOT_BINARY=/bin/sh -v "$PWD/ci:/ci:ro" \
+            "$IMAGE:latest" /ci/check-h264.sh
+
+      - name: Report inconclusive H.264 check
+        if: steps.h264.outcome != 'success'
+        run: |
+          echo "::warning::H.264 resolution check did not pass (usually YouTube unreachable from the runner). Offline contract gate passed, so the wrapper is intact - re-check manually before trusting the new image."
