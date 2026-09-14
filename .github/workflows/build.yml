@@ -16,7 +16,8 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  # container registry paths must be lowercase; github.repository preserves the case of the owner
+  IMAGE: ghcr.io/iietp/video-dl-bot-h264
 
 jobs:
   build:
