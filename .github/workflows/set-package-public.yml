@@ -1,0 +1,47 @@
+name: set-package-public
+
+# One-shot maintenance task: flip the GHCR container package to public so that
+# anonymous pulls work (the MikroTik router has no registry credentials).
+#
+# Runs with the GitHub App installation token (GITHUB_TOKEN), because the
+# `PATCH /user/packages/...` endpoint rejects OAuth app tokens.
+#
+# NOTE: making a container package public is irreversible on GitHub.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  set-public:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Try every plausible endpoint
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          api="https://api.github.com"
+          for ep in \
+            "/user/packages/container/video-dl-bot-h264" \
+            "/repos/${GITHUB_REPOSITORY}/packages/container/video-dl-bot-h264"
+          do
+            echo "===== PATCH ${ep}"
+            code="$(curl -sS -o /tmp/body -w '%{http_code}' -X PATCH \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d '{"visibility":"public"}' \
+              "${api}${ep}")"
+            echo "HTTP ${code}"
+            head -c 800 /tmp/body; echo
+          done
+
+      - name: Verify (informational)
+        run: |
+          curl -sS -o /dev/null -w 'anonymous manifest HTTP=%{http_code}\n' \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            "https://ghcr.io/v2/iietp/video-dl-bot-h264/manifests/latest" || true
