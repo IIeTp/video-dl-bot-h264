@@ -1,77 +1,66 @@
 # video-dl-bot-h264
 
-Thin, self-updating wrapper around [`tarampampam/video-dl-bot`](https://github.com/tarampampam/video-dl-bot)
-that guarantees Telegram-playable media.
+Telegram video bot built **from upstream source with two patches on top**, so that downloaded
+videos are playable and streamable in Telegram instead of arriving as a file that must be
+downloaded first.
 
-## The problem it solves
+Upstream: [`tarampampam/video-dl-bot`](https://github.com/tarampampam/video-dl-bot) (MIT).
 
-Upstream hardcodes one yt-dlp format selector:
+## What the patches change
 
-```
-bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]/bv*[ext=mp4]+ba[ext=m4a]/best[filesize<2G]/best
-```
+`patches/0001-streamable-h264-video.patch`
 
-On YouTube this resolves to **AV1** video (`av01.*`) inside an **mp4** container. Telegram cannot
-decode AV1, so its Bot API falls back to sending the download as a plain **file** instead of a
-playable video message.
+1. **Streamable `sendVideo`** (`internal/bot/bot.go`). Upstream sends
+   `tele.Video{File: tele.FromReader(fp)}` — no `supports_streaming`, no dimensions, no duration.
+   Telegram clients answer that with a **download button** instead of streaming. The patch sets
+   `Streaming: true` and fills `Width`/`Height` (parsed from the yt-dlp `resolution` field) and
+   `Duration` (already parsed by the bot).
+2. **H.264 instead of AV1** (`internal/yt-dlp/yt-dlp.go`). Upstream's selector
+   `bv*[ext=mp4][filesize<2G]+ba[ext=m4a].../best` resolves on YouTube to **AV1** (format `401`,
+   `av01.*`) inside an mp4 container. Telegram cannot decode AV1, so the Bot API degrades the
+   upload to a *document* — the file arrives without a player. The patch forces
+   `bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4][vcodec^=avc1]/b[ext=mp4]/b` plus
+   `--merge-output-format mp4`, which selects H.264/AAC in mp4.
 
-Measured on the upstream selector:
-
-```
-mp4 | av01.0.12M.08 | mp4a.40.2 | 401+140
-```
-
-With the selector this wrapper forces:
-
-```
-mp4 | avc1.640028   | mp4a.40.2 | 137+140
-```
-
-## How the fix is applied (and why it never gets clobbered)
-
-No upstream source lives in this repository, so there is nothing to sync, rebase or merge — and
-therefore nothing that can be overwritten when upstream changes.
-
-* `entrypoint.sh` prepends a shim to `PATH`. The bot resolves its yt-dlp binary with
-  `exec.LookPath("yt-dlp")`, so our shim wins.
-* The shim appends `--format <H.264/AAC first> --merge-output-format mp4` to every yt-dlp call.
-  yt-dlp is an argparse CLI where the **last** `--format` wins and options may follow the URL, so
-  this overrides the value hardcoded in the bot.
-
-All other upstream changes (new bot releases, updated yt-dlp, ffmpeg, node) arrive automatically:
-the base image is a floating tag and every build pulls it fresh (`--pull`). Upstream may rewrite
-every line of its Go code and this image will still build.
-
-## Auto-update chain
+Measured, upstream selector vs patched selector on the same YouTube URL:
 
 ```
-tarampampam/video-dl-bot:latest
-        │  (rebased on every push + daily cron, docker build --pull)
-        ▼
-ghcr.io/iietp/video-dl-bot-h264:latest
-        │  (/app/update on MikroTik RouterOS, or app auto-update)
-        ▼
-MikroTik app "tg-ytdl"
+mp4 | av01.0.12M.08 | mp4a.40.2 | 401+140     <- container is mp4, codec is AV1 (Telegram: document)
+mp4 | avc1.640028   | mp4a.40.2 | 137+140     <- H.264/AAC (Telegram: plays, and now streams)
 ```
 
-Image layers are content-addressed, so the daily rebuild is a no-op unless upstream actually
-published something new. Every build is also tagged `sha-<commit>` for instant rollback.
+## How the upstream stays updated (and the patch cannot be clobbered)
 
-## Using it
+This repository stores **no upstream source**. Every build:
 
-Straight docker:
+1. checks out `tarampampam/video-dl-bot@master` fresh,
+2. applies `patches/*.patch` with `git apply --3way`,
+3. builds the image from that source with upstream's own `Dockerfile`.
 
-```sh
-docker run -d --name bot -e BOT_TOKEN='123:AA...' ghcr.io/iietp/video-dl-bot-h264:latest
-```
+So upstream code, yt-dlp, ffmpeg, node and the Go toolchain all come straight from upstream — only
+the lines the patch touches are ours. If upstream rewrites those lines, the patch stops applying and
+the **build fails before publishing anything** (no silent regression, no rebase babysitting). A
+daily cron re-runs the build, and an unchanged upstream yields the same image.
 
-MikroTik RouterOS app (`/app`), app store YAML entry:
+## CI gates
+
+* **patch applies** — a moved line upstream fails the build loudly.
+* **bot runs** — `docker run --rm <image> --version`.
+* **patch compiled in** — the built binary must contain the forced H.264 selector, and must no
+  longer contain upstream's AV1-prone selector.
+* **selector resolves** — a real URL must resolve to `ext=mp4` + `vcodec=avc1*` (informational: it
+  needs YouTube reachable from the runner, and reports `::warning::` rather than failing when not).
+
+Tags: `latest`, `sha-<our commit>`, `upstream-<upstream commit>` — the last one makes it obvious
+which upstream revision an image was built from, and gives you a rollback target.
+
+## Using it on MikroTik RouterOS (`/app`)
 
 ```yaml
 name: tg-ytdl
 category: utilities
 'default-credentials': none
-descr: 'Telegram bot: send a link, get the video (yt-dlp, H.264/AAC mp4)'
+descr: 'Telegram bot: send a link, get a streaming video (yt-dlp, H.264/AAC mp4)'
 page: 'https://github.com/IIeTp/video-dl-bot-h264'
 services:
   'bot':
@@ -80,71 +69,38 @@ services:
       'BOT_TOKEN': '<token>'
     hostname: 'tg-ytdl'
     image: 'ghcr.io/iietp/video-dl-bot-h264:latest'
+    volumes:
+      - 'tg-ytdl/data:/data'
 ```
 
-## Knobs
+Gotchas learned the hard way:
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `YTDLP_FORMAT_OVERRIDE` | H.264/AAC-first mp4 selector | the yt-dlp format selector that is forced |
-| `YTDLP_EXTRA_ARGS` | `--merge-output-format mp4` | extra args appended after the selector |
-| `YTDLP_BIN` | `/bin/yt-dlp` | real binary the shim must call |
-| `BOT_BINARY` | `/bin/video-dl-bot` | what the entrypoint execs (used by CI smoke test) |
+* **Changing the image of an existing app** requires re-adding it — `container-command-lines` is
+  derived from the YAML only at `/app/add` time, so `/app/set yaml=...` keeps the old image, and
+  setting `container-command-lines` by hand double-prefixes the container name
+  (`download/extract failed`). Procedure: `/app/disable` → wait → `/app/remove` → `/app/add` →
+  `/app/enable`. For a newer build of the *same* image, `/app/update <app>` is enough.
+* **Package visibility**: GHCR creates the package private even when the repository is public, and
+  the package REST API accepts **classic PATs only** (`gh` OAuth tokens and `GITHUB_TOKEN` get 404).
+  RouterOS pulls anonymously, so the package must be set to Public once in the package's own
+  settings page (Danger Zone → Change visibility) — irreversibly. Alternative: keep it private and
+  put a classic PAT with `read:packages` into `/container/config`.
+* Making the package public drops the write access inherited from the repository, so
+  `GITHUB_TOKEN` pushes then fail with `denied: permission_denied: write_package`. Either re-add the
+  repository under the package's *Manage Actions access* with role **Write**, or add a repository
+  secret `GHCR_PAT` (classic PAT, `write:packages`) — the workflow prefers it automatically.
 
-All upstream variables (`BOT_TOKEN`, `COOKIES_FILE`, `MAX_CONCURRENT_DOWNLOADS`, `JS_RUNTIMES`,
-`LOG_LEVEL`, `LOG_FORMAT`) keep working unchanged.
+## Adding another patch
 
-## Package visibility (required for MikroTik / anonymous pulls)
-
-GHCR creates the container package as **private**, even when the repository is public. RouterOS pulls
-anonymously (its `/container/config` has no registry credentials), so the package must be flipped to
-public once, by hand:
-
-1. open `https://github.com/users/<owner>/packages/container/package/video-dl-bot-h264/settings`
-2. **Danger Zone** → **Change visibility** → **Public** → type the package name → confirm
-
-This is UI-only: the package REST API accepts **classic PATs only** — OAuth tokens from the `gh` CLI
-and GitHub App installation tokens (`GITHUB_TOKEN` in Actions) both get `404 Not Found`. Making a
-container package public is irreversible.
-
-Alternative without touching visibility: keep the package private and give the router credentials
-(`/container/config set username=<user> password=<classic PAT with read:packages>`).
-
-**Side effect of the flip:** changing a package's visibility to public drops the access it inherited
-from the linked repository, so `GITHUB_TOKEN` can no longer push to it
-(`denied: permission_denied: write_package`). Fix either way:
-
-* package page → **Manage Actions access** → **Add repository** → this repo → role **Write**, or
-* add a repo secret `GHCR_PAT` (classic PAT with `write:packages`); the workflow prefers it over
-  `GITHUB_TOKEN` automatically.
-
-## Switching MikroTik `/app` to a new build
-
-RouterOS derives the container spec (`container-command-lines`) from the YAML **only when the app is
-added**. Editing `yaml` in place does not re-derive it, and setting `container-command-lines` by hand
-is a footgun (the app prefixes the container name itself, so the value double-prefixes and the image
-becomes invalid → `download/extract failed`). To move to a new image:
-
-```routeros
-/app/disable <app>     ; # wait until fully disabled, otherwise "cannot set during cleanup"
-/app/remove  <app>
-/app/add network=internal yaml=[/file/get tg-ytdl.yml contents]
-/app/enable  <app>
+```sh
+git clone https://github.com/tarampampam/video-dl-bot && cd video-dl-bot
+# edit, keep the diff minimal
+git diff > ../video-dl-bot-h264/patches/0002-something.patch
 ```
 
-## CI gates
-
-Every build runs three checks before the image is considered good:
-
-1. `docker run ... image --version` — entrypoint → shim → bot chain still works.
-2. `command -v yt-dlp` inside the image must print the shim path — proves the `LookPath` contract.
-3. `ci/check-h264.sh` — resolves a real URL and asserts `ext=mp4` + `vcodec=avc1*`
-   (informational: it needs YouTube reachable from the runner).
-
-If upstream ever changes the two runtime invariants this wrapper relies on (`LookPath` lookup and
-last-`--format` precedence), gate 2 or 3 fails and the problem is visible instead of silent.
+Keep one commit's worth of change per patch and keep the diff small — that is what keeps the patch
+applying cleanly across upstream releases.
 
 ## License
 
-MIT for the wrapper. The wrapped upstream project is MIT as well — see
-[tarampampam/video-dl-bot](https://github.com/tarampampam/video-dl-bot).
+MIT, same as upstream.

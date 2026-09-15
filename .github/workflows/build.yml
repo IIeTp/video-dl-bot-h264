@@ -1,8 +1,9 @@
 name: build-and-publish
 
-# Re-based on the newest upstream image on every push, daily (cron) and on demand.
-# Content-addressed layers mean an unchanged upstream produces an unchanged image,
-# so a daily run is a cheap no-op unless upstream actually published something new.
+# Builds upstream tarampampam/video-dl-bot from source, applies our patches on top, and
+# publishes the result. Upstream is always fetched fresh, so every upstream change flows
+# through; only the lines our patches touch are ours. If upstream moves those lines, the
+# patch no longer applies and the build fails loudly instead of silently dropping the fix.
 
 on:
   push:
@@ -11,8 +12,7 @@ on:
     - cron: "23 3 * * *"
   workflow_dispatch:
 
-# Serialise runs: overlapping jobs fight over the runner tool caches
-# ("Unable to reserve cache with key docker.io--tonistiigi--binfmt-...").
+# Serialise runs: overlapping jobs fight over the runner tool caches.
 concurrency:
   group: build-and-publish
   cancel-in-progress: true
@@ -22,19 +22,44 @@ permissions:
   packages: write
 
 env:
-  # container registry paths must be lowercase; github.repository preserves the case of the owner
   IMAGE: ghcr.io/iietp/video-dl-bot-h264
+  UPSTREAM: tarampampam/video-dl-bot
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # All actions are pinned to majors that run on Node 24 (Node 20 is deprecated).
+      # Our repository: patches + workflow + ci only, no upstream source.
       - uses: actions/checkout@v7
 
-      # cache-image: the binfmt image lives in the runner's tool cache already, and the
-      # Actions cache key for it is repository-wide, so saving it only races other runs
-      # ("Unable to reserve cache with key docker.io--tonistiigi--binfmt-...").
+      - name: Check out upstream
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: master
+          path: src
+
+      # Gate: a patch that no longer applies fails here, before anything is built or published.
+      - name: Apply patches
+        working-directory: src
+        run: |
+          set -euo pipefail
+          for patch in ../patches/*.patch; do
+            echo "::group::applying ${patch}"
+            git apply --3way --verbose "${patch}"
+            echo "::endgroup::"
+          done
+
+      - name: Record applied revisions
+        id: rev
+        working-directory: src
+        run: |
+          set -euo pipefail
+          echo "upstream_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # cache-image: the binfmt image lives in the runner tool cache already, and its Actions
+      # cache key is repository-wide, so saving it only races other runs.
       - uses: docker/setup-qemu-action@v4
         with:
           cache-image: false
@@ -50,51 +75,40 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Resolve upstream base digest
-        id: base
-        run: |
-          set -euo pipefail
-          digest="$(docker buildx imagetools inspect ghcr.io/tarampampam/video-dl-bot:latest --format '{{.Manifest.Digest}}')"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "upstream base digest: ${digest}"
-
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: .
-          pull: true
+          context: src
           platforms: linux/amd64,linux/arm64
           push: true
+          # APP_VERSION stamps the binary; upstream Dockerfile forwards it to -ldflags
           build-args: |
-            BASE_DIGEST=${{ steps.base.outputs.digest }}
+            APP_VERSION=${{ steps.rev.outputs.upstream_sha }}@ghcr
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:sha-${{ github.sha }}
+            ${{ env.IMAGE }}:upstream-${{ steps.rev.outputs.upstream_short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Gate 1: the wrapper must keep the bot runnable (entrypoint -> shim -> exec bot).
-      - name: Smoke test - entrypoint chain
+      # Gate 1: the image runs and the bot starts (upstream entrypoint untouched).
+      - name: Smoke test - bot runs
         run: docker run --rm "$IMAGE:latest" --version
 
-      # Gate 2: deterministic contract - shim wins the PATH lookup and injects the selector.
-      # This is what breaks visibly if upstream ever stops using exec.LookPath / last-format-wins.
-      - name: Smoke test - shim contract (offline)
+      # Gate 2: the yt-dlp selector patch is actually compiled into the binary.
+      - name: Smoke test - patched selector compiled in
         run: |
-          docker run --rm -e BOT_BINARY=/bin/sh -v "$PWD/ci:/ci:ro" \
-            "$IMAGE:latest" /ci/check-h264.sh --offline
+          docker run --rm -v "$PWD/ci:/ci:ro" --entrypoint /bin/sh "$IMAGE:latest" /ci/check-patched-bot.sh --offline
 
-      # Gate 3: real resolution must yield mp4/H.264/AAC. Needs YouTube reachable from the
-      # runner; reported as a warning (not a failure) when it is not, so that a blocked
-      # datacenter IP cannot fail an otherwise good build - but it can never pass silently.
+      # Gate 3: the patched selector really resolves to Telegram-playable H.264 inside mp4.
+      # Needs YouTube from the runner; reported as a warning (not a failure) when unavailable.
       - name: Smoke test - H.264 resolution (network)
         id: h264
         continue-on-error: true
         run: |
-          docker run --rm -e BOT_BINARY=/bin/sh -v "$PWD/ci:/ci:ro" \
-            "$IMAGE:latest" /ci/check-h264.sh
+          docker run --rm -v "$PWD/ci:/ci:ro" -v "$PWD/patches:/patches:ro" --entrypoint /bin/sh "$IMAGE:latest" /ci/check-patched-bot.sh
 
       - name: Report inconclusive H.264 check
         if: steps.h264.outcome != 'success'
         run: |
-          echo "::warning::H.264 resolution check did not pass (usually YouTube unreachable from the runner). Offline contract gate passed, so the wrapper is intact - re-check manually before trusting the new image."
+          echo "::warning::H.264 resolution check did not pass (usually YouTube unreachable from the runner). The gates above passed, so the image is intact - re-check manually before trusting it."

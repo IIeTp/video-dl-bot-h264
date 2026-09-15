@@ -1,0 +1,66 @@
+diff --git a/internal/bot/bot.go b/internal/bot/bot.go
+index 5d22004..1ecd5b1 100644
+--- a/internal/bot/bot.go
++++ b/internal/bot/bot.go
+@@ -6,6 +6,8 @@ import (
+ 	"log/slog"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	tele "gopkg.in/telebot.v4"
+@@ -268,7 +270,15 @@ func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc
+ 
+ 		// telegram upload limit is 50MB
+ 		if fileSizeMb <= 50 { //nolint:mnd
+-			if err := b.replyWithVideo(userMsg, tele.Video{File: tele.FromReader(fp)}); err != nil {
++			width, height := parseResolution(dl.Resolution)
++
++			if err := b.replyWithVideo(userMsg, tele.Video{
++				File:      tele.FromReader(fp),
++				Streaming: true, // without this flag Telegram clients offer "download" instead of streaming
++				Width:     width,
++				Height:    height,
++				Duration:  int(dl.Duration.Seconds()),
++			}); err != nil {
+ 				b.log.Error("failed to upload video to Telegram",
+ 					slog.String("error", err.Error()),
+ 					slog.Int64("file_size", stat.Size()),
+@@ -329,6 +339,19 @@ func (b *Bot) reply(to *tele.Message, msg string, opts ...any) (err error) {
+ 	return
+ }
+ 
++// parseResolution splits a yt-dlp resolution string like "1920x1080" into width and height.
++func parseResolution(s string) (width, height int) {
++	parts := strings.SplitN(strings.TrimSpace(s), "x", 2)
++	if len(parts) != 2 {
++		return 0, 0
++	}
++
++	width, _ = strconv.Atoi(strings.TrimSpace(parts[0]))
++	height, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
++
++	return width, height
++}
++
+ // replyWithVideo sends a video file either as a reply or a fresh message.
+ func (b *Bot) replyWithVideo(to *tele.Message, v tele.Video) (err error) {
+ 	_, err = b.client.Reply(to, &v)
+diff --git a/internal/yt-dlp/yt-dlp.go b/internal/yt-dlp/yt-dlp.go
+index 572f1bf..2d17697 100644
+--- a/internal/yt-dlp/yt-dlp.go
++++ b/internal/yt-dlp/yt-dlp.go
+@@ -134,7 +134,10 @@ func Download(ctx context.Context, in string, opts ...Option) (_ *Downloaded, ou
+ 			"--no-progress", // do not print progress bar
+ 			// video format options
+ 			// https://github.com/yt-dlp/yt-dlp?tab=readme-ov-file#format-selection
+-			"--format", "bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]/bv*[ext=mp4]+ba[ext=m4a]/best[filesize<2G]/best",
++			// H.264/AAC first: Telegram can only play MPEG4 videos with codecs its clients decode,
++			// while the default selector picks AV1 (YouTube format 401) that degrades to a file.
++			"--format", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4][vcodec^=avc1]/b[ext=mp4]/b",
++			"--merge-output-format", "mp4", // keep the merged container mp4 regardless of the streams picked
+ 			"--no-post-overwrites", // do not overwrite post-processed files
+ 			"--no-embed-info-json", // do not embed the infojson as an attachment to the video file
+ 		}
