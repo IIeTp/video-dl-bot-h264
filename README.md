@@ -94,6 +94,36 @@ services:
 All upstream variables (`BOT_TOKEN`, `COOKIES_FILE`, `MAX_CONCURRENT_DOWNLOADS`, `JS_RUNTIMES`,
 `LOG_LEVEL`, `LOG_FORMAT`) keep working unchanged.
 
+## Package visibility (required for MikroTik / anonymous pulls)
+
+GHCR creates the container package as **private**, even when the repository is public. RouterOS pulls
+anonymously (its `/container/config` has no registry credentials), so the package must be flipped to
+public once, by hand:
+
+1. open `https://github.com/users/<owner>/packages/container/package/video-dl-bot-h264/settings`
+2. **Danger Zone** → **Change visibility** → **Public** → type the package name → confirm
+
+This is UI-only: the package REST API accepts **classic PATs only** — OAuth tokens from the `gh` CLI
+and GitHub App installation tokens (`GITHUB_TOKEN` in Actions) both get `404 Not Found`. Making a
+container package public is irreversible.
+
+Alternative without touching visibility: keep the package private and give the router credentials
+(`/container/config set username=<user> password=<classic PAT with read:packages>`).
+
+## Switching MikroTik `/app` to a new build
+
+RouterOS derives the container spec (`container-command-lines`) from the YAML **only when the app is
+added**. Editing `yaml` in place does not re-derive it, and setting `container-command-lines` by hand
+is a footgun (the app prefixes the container name itself, so the value double-prefixes and the image
+becomes invalid → `download/extract failed`). To move to a new image:
+
+```routeros
+/app/disable <app>     ; # wait until fully disabled, otherwise "cannot set during cleanup"
+/app/remove  <app>
+/app/add network=internal yaml=[/file/get tg-ytdl.yml contents]
+/app/enable  <app>
+```
+
 ## CI gates
 
 Every build runs three checks before the image is considered good:
