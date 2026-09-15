@@ -2,12 +2,13 @@
 # CI smoke test, runs INSIDE the built image.
 #
 #   check-patched-bot.sh --offline   deterministic gates only (no network)
-#   check-patched-bot.sh [url]       same, plus a real yt-dlp resolution of [url]
+#   check-patched-bot.sh [url]       same, plus an informational resolution of [url]
 #
-# Offline gates prove the image really carries our patches:
-#   1. the video-dl-bot binary contains the forced H.264 selector (yt-dlp patch),
-#   2. the bot binary starts.
-# The network part proves that selector yields Telegram-playable H.264/mp4 in practice.
+# Deterministic gates prove the image is what we think it is:
+#   1. the binary carries upstream's standard format selector and no codec override,
+#   2. the bot binary runs.
+# The network part only reports what the standard selector resolves to - it asserts nothing
+# about the codec, because format selection is intentionally left to upstream.
 
 set -eu
 
@@ -17,22 +18,24 @@ case "${1:-}" in
 esac
 URL="${2:-https://www.youtube.com/watch?v=dQw4w9WgXcQ}"
 
+# upstream's selector, kept in sync by gate 1 below (if upstream changes it, gate 1 fails)
+STD_SELECTOR="bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]/bv*[ext=mp4]+ba[ext=m4a]/best[filesize<2G]/best"
+
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# ---- gate 1: the patched selector is compiled into the bot binary -------------------
-python3 - <<'PY'
-import sys
+# ---- gate 1: standard selector in, codec override out -------------------------------
+STD_SELECTOR="$STD_SELECTOR" python3 - <<'PY'
+import os, sys
 blob = open("/bin/video-dl-bot", "rb").read()
 
-needle = b"vcodec^=avc1"
-if needle not in blob:
-    sys.exit("FAIL: the H.264 selector patch is missing from the built binary")
+std = os.environ["STD_SELECTOR"].encode()
+if std not in blob:
+    sys.exit("FAIL: upstream's standard selector is not compiled into the binary")
 
-stale = b"bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]"
-if stale in blob:
-    sys.exit("FAIL: the upstream AV1-prone selector is still compiled in")
+if b"vcodec^=avc1" in blob:
+    sys.exit("FAIL: an H.264 selector override is compiled in - the codec patch was removed")
 
-print("OK: patched H.264 selector is compiled into the bot binary")
+print("OK: binary carries upstream's standard selector, no codec override")
 PY
 
 # ---- gate 2: the bot starts ---------------------------------------------------------
@@ -41,33 +44,14 @@ echo "OK: bot binary runs"
 
 [ "$OFFLINE" = "1" ] && { echo "OK (offline gates passed)"; exit 0; }
 
-# ---- gate 3: the selector resolves to H.264/mp4 in practice -------------------------
+# ---- informational: what the standard selector picks --------------------------------
 command -v python3 >/dev/null 2>&1 || fail "python3 is required by this check"
-[ -d /patches ] || fail "/patches is not mounted"
-
-SELECTOR="$(python3 - <<'PY'
-import glob, re, sys
-pat = re.compile(r'\+\s*"--format",\s*"([^"]+)"')
-for path in sorted(glob.glob("/patches/*.patch")):
-    m = pat.search(open(path).read())
-    if m:
-        print(m.group(1))
-        break
-else:
-    sys.exit("could not read the forced selector out of the patch file")
-PY
-)"
-echo "selector from the patch: ${SELECTOR}"
 
 yt-dlp --version
-json="$(yt-dlp --simulate -J --no-warnings --format "$SELECTOR" "$URL")"
+json="$(yt-dlp --simulate -J --no-warnings --format "$STD_SELECTOR" "$URL")"
 printf '%s' "$json" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-ext, vcodec, acodec = d.get("ext"), d.get("vcodec"), d.get("acodec")
-print("resolved: ext=%s vcodec=%s acodec=%s" % (ext, vcodec, acodec))
-assert ext == "mp4", "container is not mp4 -> Telegram would send a file"
-assert (vcodec or "").startswith("avc1"), "selector did not pick H.264"
-assert (acodec or "").startswith("mp4a"), "audio is not AAC"
-print("OK: Telegram-playable mp4/H.264/AAC")
+print("standard selector resolved: ext=%s vcodec=%s acodec=%s" % (d.get("ext"), d.get("vcodec"), d.get("acodec")))
+print("note: AV1/VP9 here means Telegram will deliver such videos as documents - accepted by choice")
 '

@@ -50,6 +50,15 @@ jobs:
             echo "::endgroup::"
           done
 
+      # Gate: the applied source really contains what the patch promises.
+      - name: Verify patched source
+        working-directory: src
+        run: |
+          set -euo pipefail
+          grep -q 'Streaming: true' internal/bot/bot.go
+          grep -q 'func parseResolution' internal/bot/bot.go
+          echo "OK: sendVideo streaming metadata is present in the patched source"
+
       - name: Record applied revisions
         id: rev
         working-directory: src
@@ -95,20 +104,20 @@ jobs:
       - name: Smoke test - bot runs
         run: docker run --rm "$IMAGE:latest" --version
 
-      # Gate 2: the yt-dlp selector patch is actually compiled into the binary.
-      - name: Smoke test - patched selector compiled in
+      # Gate 2: binary carries upstream's standard selector (and no codec override), bot runs.
+      - name: Smoke test - image contract (offline)
         run: |
           docker run --rm -v "$PWD/ci:/ci:ro" --entrypoint /bin/sh "$IMAGE:latest" /ci/check-patched-bot.sh --offline
 
-      # Gate 3: the patched selector really resolves to Telegram-playable H.264 inside mp4.
-      # Needs YouTube from the runner; reported as a warning (not a failure) when unavailable.
-      - name: Smoke test - H.264 resolution (network)
-        id: h264
+      # Informational: what the standard selector picks for a real URL. Needs YouTube from the
+      # runner; asserts nothing about the codec, because format selection stays with upstream.
+      - name: Smoke test - resolution report (network)
+        id: resolve
         continue-on-error: true
         run: |
-          docker run --rm -v "$PWD/ci:/ci:ro" -v "$PWD/patches:/patches:ro" --entrypoint /bin/sh "$IMAGE:latest" /ci/check-patched-bot.sh
+          docker run --rm -v "$PWD/ci:/ci:ro" --entrypoint /bin/sh "$IMAGE:latest" /ci/check-patched-bot.sh
 
-      - name: Report inconclusive H.264 check
-        if: steps.h264.outcome != 'success'
+      - name: Report inconclusive resolution report
+        if: steps.resolve.outcome != 'success'
         run: |
-          echo "::warning::H.264 resolution check did not pass (usually YouTube unreachable from the runner). The gates above passed, so the image is intact - re-check manually before trusting it."
+          echo "::warning::The resolution report did not run (usually YouTube unreachable from the runner). The gates above passed, so the image is intact."

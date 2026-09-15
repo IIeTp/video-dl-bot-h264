@@ -48,19 +48,3 @@ index 5d22004..1ecd5b1 100644
  // replyWithVideo sends a video file either as a reply or a fresh message.
  func (b *Bot) replyWithVideo(to *tele.Message, v tele.Video) (err error) {
  	_, err = b.client.Reply(to, &v)
-diff --git a/internal/yt-dlp/yt-dlp.go b/internal/yt-dlp/yt-dlp.go
-index 572f1bf..2d17697 100644
---- a/internal/yt-dlp/yt-dlp.go
-+++ b/internal/yt-dlp/yt-dlp.go
-@@ -134,7 +134,10 @@ func Download(ctx context.Context, in string, opts ...Option) (_ *Downloaded, ou
- 			"--no-progress", // do not print progress bar
- 			// video format options
- 			// https://github.com/yt-dlp/yt-dlp?tab=readme-ov-file#format-selection
--			"--format", "bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]/bv*[ext=mp4]+ba[ext=m4a]/best[filesize<2G]/best",
-+			// H.264/AAC first: Telegram can only play MPEG4 videos with codecs its clients decode,
-+			// while the default selector picks AV1 (YouTube format 401) that degrades to a file.
-+			"--format", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4][vcodec^=avc1]/b[ext=mp4]/b",
-+			"--merge-output-format", "mp4", // keep the merged container mp4 regardless of the streams picked
- 			"--no-post-overwrites", // do not overwrite post-processed files
- 			"--no-embed-info-json", // do not embed the infojson as an attachment to the video file
- 		}

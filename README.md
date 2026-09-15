@@ -1,33 +1,36 @@
 # video-dl-bot-h264
 
-Telegram video bot built **from upstream source with two patches on top**, so that downloaded
-videos are playable and streamable in Telegram instead of arriving as a file that must be
-downloaded first.
+Telegram video bot built **from upstream source with one patch on top**: videos are sent as
+*streamable* Telegram videos (with dimensions and duration) instead of files that must be
+downloaded before they play.
 
 Upstream: [`tarampampam/video-dl-bot`](https://github.com/tarampampam/video-dl-bot) (MIT).
 
-## What the patches change
+> The `-h264` suffix is historical: an earlier revision of this repo also forced the H.264 format
+> selector. That patch was dropped — format selection is deliberately left to upstream, so videos
+> that upstream resolves to AV1/VP9 will again be delivered by Telegram as documents. Only the
+> streaming patch remains.
 
-`patches/0001-streamable-h264-video.patch`
+## What the patch changes
 
-1. **Streamable `sendVideo`** (`internal/bot/bot.go`). Upstream sends
-   `tele.Video{File: tele.FromReader(fp)}` — no `supports_streaming`, no dimensions, no duration.
-   Telegram clients answer that with a **download button** instead of streaming. The patch sets
-   `Streaming: true` and fills `Width`/`Height` (parsed from the yt-dlp `resolution` field) and
-   `Duration` (already parsed by the bot).
-2. **H.264 instead of AV1** (`internal/yt-dlp/yt-dlp.go`). Upstream's selector
-   `bv*[ext=mp4][filesize<2G]+ba[ext=m4a].../best` resolves on YouTube to **AV1** (format `401`,
-   `av01.*`) inside an mp4 container. Telegram cannot decode AV1, so the Bot API degrades the
-   upload to a *document* — the file arrives without a player. The patch forces
-   `bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4][vcodec^=avc1]/b[ext=mp4]/b` plus
-   `--merge-output-format mp4`, which selects H.264/AAC in mp4.
+`patches/0001-streamable-sendvideo.patch` — `internal/bot/bot.go` only:
 
-Measured, upstream selector vs patched selector on the same YouTube URL:
-
+```go
+tele.Video{
+    File:      tele.FromReader(fp),
+    Streaming: true,                       // json: supports_streaming
+    Width:     width,                      // parsed from the yt-dlp "resolution" field
+    Height:    height,
+    Duration:  int(dl.Duration.Seconds()), // already parsed from the info.json
+}
 ```
-mp4 | av01.0.12M.08 | mp4a.40.2 | 401+140     <- container is mp4, codec is AV1 (Telegram: document)
-mp4 | avc1.640028   | mp4a.40.2 | 137+140     <- H.264/AAC (Telegram: plays, and now streams)
-```
+
+Upstream sends `tele.Video{File: tele.FromReader(fp)}` — no `supports_streaming`, no dimensions, no
+duration. Telegram clients answer that with a **download button** instead of streaming the video,
+and render a blank bubble until the file is fetched. Per the Bot API,
+`supports_streaming` is *"Pass True if the uploaded video is suitable for streaming"* and defaults to
+absent; per the TDLib maintainer it asserts that audio and video streams are **interleaved**, which
+is what lets a client fetch the file by byte ranges.
 
 ## How the upstream stays updated (and the patch cannot be clobbered)
 
@@ -39,17 +42,19 @@ This repository stores **no upstream source**. Every build:
 
 So upstream code, yt-dlp, ffmpeg, node and the Go toolchain all come straight from upstream — only
 the lines the patch touches are ours. If upstream rewrites those lines, the patch stops applying and
-the **build fails before publishing anything** (no silent regression, no rebase babysitting). A
-daily cron re-runs the build, and an unchanged upstream yields the same image.
+the **build fails before publishing anything** (no silent regression, no rebase babysitting). A daily
+cron re-runs the build, and an unchanged upstream yields the same image.
 
 ## CI gates
 
 * **patch applies** — a moved line upstream fails the build loudly.
+* **patched source verified** — the applied source must contain `Streaming: true` and the
+  `parseResolution` helper.
 * **bot runs** — `docker run --rm <image> --version`.
-* **patch compiled in** — the built binary must contain the forced H.264 selector, and must no
-  longer contain upstream's AV1-prone selector.
-* **selector resolves** — a real URL must resolve to `ext=mp4` + `vcodec=avc1*` (informational: it
-  needs YouTube reachable from the runner, and reports `::warning::` rather than failing when not).
+* **image contract** — the binary must carry upstream's standard format selector and must *not*
+  carry any H.264 override, so a re-introduced codec patch cannot slip in unnoticed.
+* **resolution report** — informational: prints what the standard selector picks for a real URL
+  (needs YouTube from the runner; reports `::warning::` rather than failing when unavailable).
 
 Tags: `latest`, `sha-<our commit>`, `upstream-<upstream commit>` — the last one makes it obvious
 which upstream revision an image was built from, and gives you a rollback target.
@@ -60,7 +65,7 @@ which upstream revision an image was built from, and gives you a rollback target
 name: tg-ytdl
 category: utilities
 'default-credentials': none
-descr: 'Telegram bot: send a link, get a streaming video (yt-dlp, H.264/AAC mp4)'
+descr: 'Telegram bot: send a link, get a streaming video'
 page: 'https://github.com/IIeTp/video-dl-bot-h264'
 services:
   'bot':
@@ -98,8 +103,9 @@ git clone https://github.com/tarampampam/video-dl-bot && cd video-dl-bot
 git diff > ../video-dl-bot-h264/patches/0002-something.patch
 ```
 
-Keep one commit's worth of change per patch and keep the diff small — that is what keeps the patch
-applying cleanly across upstream releases.
+Keep one change per patch and keep the diff small — that is what keeps patches applying cleanly
+across upstream releases. If the codec override is ever wanted again, it is a second patch on
+`internal/yt-dlp/yt-dlp.go` (see the git history of this repository for the exact selector).
 
 ## License
 
