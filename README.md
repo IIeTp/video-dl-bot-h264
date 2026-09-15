@@ -110,6 +110,14 @@ container package public is irreversible.
 Alternative without touching visibility: keep the package private and give the router credentials
 (`/container/config set username=<user> password=<classic PAT with read:packages>`).
 
+**Side effect of the flip:** changing a package's visibility to public drops the access it inherited
+from the linked repository, so `GITHUB_TOKEN` can no longer push to it
+(`denied: permission_denied: write_package`). Fix either way:
+
+* package page → **Manage Actions access** → **Add repository** → this repo → role **Write**, or
+* add a repo secret `GHCR_PAT` (classic PAT with `write:packages`); the workflow prefers it over
+  `GITHUB_TOKEN` automatically.
+
 ## Switching MikroTik `/app` to a new build
 
 RouterOS derives the container spec (`container-command-lines`) from the YAML **only when the app is
