@@ -32,7 +32,12 @@ jobs:
       # All actions are pinned to majors that run on Node 24 (Node 20 is deprecated).
       - uses: actions/checkout@v7
 
+      # cache-image: the binfmt image lives in the runner's tool cache already, and the
+      # Actions cache key for it is repository-wide, so saving it only races other runs
+      # ("Unable to reserve cache with key docker.io--tonistiigi--binfmt-...").
       - uses: docker/setup-qemu-action@v4
+        with:
+          cache-image: false
       - uses: docker/setup-buildx-action@v4
 
       # GITHUB_TOKEN can push only while the package inherits write access from this repository.
